@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>人物認識 背景スライドショー</title>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js"></script>
+  <style>
+    html, body {
+      margin: 0; width: 100%; height: 100%; overflow: hidden;
+      background: #111;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif;
+      touch-action: manipulation;
+    }
+    #output { position: fixed; inset: 0; width: 100vw; height: 100dvh; background: #111; }
+    #video {
+      position: fixed; left: -9999px; top: -9999px;
+      width: 1px; height: 1px; opacity: 0; pointer-events: none;
+    }
+    #startScreen {
+      position: fixed; inset: 0; z-index: 20; display: flex;
+      align-items: center; justify-content: center; padding: 24px;
+      color: white; background: radial-gradient(circle at center, #2c3e50, #111);
+      text-align: center;
+    }
+    .startCard {
+      width: min(92vw, 430px); padding: 24px 20px; border-radius: 24px;
+      background: rgba(0,0,0,0.44); backdrop-filter: blur(12px);
+      box-shadow: 0 20px 60px rgba(0,0,0,0.35);
+    }
+    .startCard h1 { margin: 0 0 12px; font-size: 21px; line-height: 1.35; }
+    .startCard p { margin: 8px 0; font-size: 14px; line-height: 1.7; opacity: 0.9; }
+    #startButton {
+      margin-top: 16px; width: 100%; border: 0; border-radius: 999px;
+      padding: 15px 18px; font-size: 17px; font-weight: 700;
+      background: white; color: #111; cursor: pointer;
+    }
+    #status {
+      margin-top: 14px; padding: 10px; border-radius: 12px;
+      background: rgba(255,255,255,0.12); font-size: 13px; line-height: 1.55;
+      word-break: break-word;
+    }
+    .panel {
+      position: fixed;
+      left: max(12px, env(safe-area-inset-left));
+      top: max(12px, env(safe-area-inset-top));
+      z-index: 10; padding: 11px 12px; border-radius: 16px;
+      color: white; background: rgba(0,0,0,0.48); backdrop-filter: blur(10px);
+      font-size: 12px; line-height: 1.55; user-select: none;
+      max-width: min(88vw, 340px);
+    }
+    .panel label { display: block; margin-top: 8px; }
+    .panel input[type="file"] { width: 100%; max-width: 300px; font-size: 12px; }
+    .panel input[type="range"] { width: 150px; vertical-align: middle; }
+    .smallButton {
+      margin-top: 8px; border: 0; border-radius: 999px;
+      padding: 7px 12px; background: white; color: #111; cursor: pointer;
+    }
+    .hint { margin-top: 6px; opacity: 0.76; font-size: 11px; }
+  </style>
+</head>
+<body>
+  <video id="video" autoplay muted playsinline webkit-playsinline></video>
+  <canvas id="output"></canvas>
+
+  <div id="startScreen">
+    <div class="startCard">
+      <h1>人物認識＋背景スライドショー</h1>
+      <p>人物だけを認識し、背景を写真スライドショーに置き換えます。</p>
+      <p>iPhone / iPadではSafariでHTTPSのURLとして開いてください。</p>
+      <button id="startButton">カメラを開始</button>
+      <div id="status">待機中</div>
+    </div>
+  </div>
+
+  <div class="panel" id="panel" style="display:none;">
+    <strong>背景スライドショー</strong>
+    <label>写真を選択：<input id="fileInput" type="file" accept="image/*" multiple /></label>
+    <label>切替：
+      <input id="speed" type="range" min="1500" max="10000" value="4000" step="500" />
+      <span id="speedText">4.0秒</span>
+    </label>
+    <label>輪郭：
+      <input id="blur" type="range" min="0" max="10" value="3" step="1" />
+      <span id="blurText">3</span>
+    </label>
+    <button class="smallButton" id="hidePanel">UIを隠す</button>
+    <div class="hint">画面を3回タップするとUIを再表示します。</div>
+  </div>
+
+  <script>
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("output");
+    const ctx = canvas.getContext("2d", { alpha: false });
+    const startScreen = document.getElementById("startScreen");
+    const startButton = document.getElementById("startButton");
+    const statusEl = document.getElementById("status");
+    const panel = document.getElementById("panel");
+    const fileInput = document.getElementById("fileInput");
+    const speed = document.getElementById("speed");
+    const speedText = document.getElementById("speedText");
+    const blur = document.getElementById("blur");
+    const blurText = document.getElementById("blurText");
+    const hidePanel = document.getElementById("hidePanel");
+
+    const personCanvas = document.createElement("canvas");
+    const personCtx = personCanvas.getContext("2d");
+    const maskCanvas = document.createElement("canvas");
+    const maskCtx = maskCanvas.getContext("2d");
+
+    let slideImages = [], currentSlide = 0, nextSlide = 0;
+    let lastSwitchTime = performance.now();
+    const fadeDuration = 800;
+    let segmentation = null, cameraRunning = false, processing = false, lastFrameTime = 0;
+    const targetFPS = 24;
+    const fallbackBackgrounds = [
+      ["#1b2735", "#090a0f"], ["#24404f", "#7aa6b2"],
+      ["#3b2557", "#8d5b7a"], ["#164f55", "#90ba8f"]
+    ];
+
+    function setStatus(msg) { statusEl.textContent = msg; }
+    function isSecureEnough() {
+      return location.protocol === "https:" || location.hostname === "localhost" || location.hostname === "127.0.0.1";
+    }
+    function resizeCanvas() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const w = Math.floor(window.innerWidth * dpr);
+      const h = Math.floor(window.innerHeight * dpr);
+      canvas.width = w; canvas.height = h;
+      canvas.style.width = window.innerWidth + "px";
+      canvas.style.height = window.innerHeight + "px";
+      personCanvas.width = w; personCanvas.height = h;
+      maskCanvas.width = w; maskCanvas.height = h;
+    }
+    window.addEventListener("resize", resizeCanvas);
+    window.addEventListener("orientationchange", () => setTimeout(resizeCanvas, 250));
+    resizeCanvas();
+
+    speed.addEventListener("input", () => speedText.textContent = (Number(speed.value) / 1000).toFixed(1) + "秒");
+    blur.addEventListener("input", () => blurText.textContent = blur.value);
+    hidePanel.addEventListener("click", () => panel.style.display = "none");
+
+    let tapTimes = [];
+    window.addEventListener("touchend", () => {
+      const now = performance.now();
+      tapTimes = tapTimes.filter(t => now - t < 700);
+      tapTimes.push(now);
+      if (tapTimes.length >= 3) {
+        panel.style.display = panel.style.display === "none" ? "block" : "none";
+        tapTimes = [];
+      }
+    });
+
+    fileInput.addEventListener("change", async (e) => {
+      const files = Array.from(e.target.files || []);
+      for (const img of slideImages) if (img._objectUrl) URL.revokeObjectURL(img._objectUrl);
+      slideImages = [];
+      for (const file of files) {
+        const url = URL.createObjectURL(file);
+        const img = new Image();
+        img._objectUrl = url;
+        img.src = url;
+        await img.decode().catch(() => {});
+        slideImages.push(img);
+      }
+      currentSlide = 0;
+      nextSlide = slideImages.length > 1 ? 1 : 0;
+      lastSwitchTime = performance.now();
+    });
+
+    function drawCoverImage(targetCtx, img, x, y, w, h, alpha = 1) {
+      if (!img || !img.width || !img.height) return;
+      const imgRatio = img.width / img.height;
+      const canvasRatio = w / h;
+      let sw, sh, sx, sy;
+      if (imgRatio > canvasRatio) {
+        sh = img.height; sw = img.height * canvasRatio; sx = (img.width - sw) / 2; sy = 0;
+      } else {
+        sw = img.width; sh = img.width / canvasRatio; sx = 0; sy = (img.height - sh) / 2;
+      }
+      targetCtx.save();
+      targetCtx.globalAlpha = alpha;
+      targetCtx.drawImage(img, sx, sy, sw, sh, x, y, w, h);
+      targetCtx.restore();
+    }
+
+    function drawFallbackBackground(now) {
+      const index = Math.floor(now / Number(speed.value)) % fallbackBackgrounds.length;
+      const colors = fallbackBackgrounds[index];
+      const g = ctx.createLinearGradient(0, 0, canvas.width, canvas.height);
+      g.addColorStop(0, colors[0]);
+      g.addColorStop(1, colors[1]);
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+
+    function drawSlideshowBackground(now) {
+      if (slideImages.length === 0) { drawFallbackBackground(now); return; }
+      const interval = Number(speed.value);
+      if (now - lastSwitchTime > interval) {
+        currentSlide = nextSlide;
+        nextSlide = (nextSlide + 1) % slideImages.length;
+        lastSwitchTime = now;
+      }
+      const fade = Math.min(1, (now - lastSwitchTime) / fadeDuration);
+      drawCoverImage(ctx, slideImages[currentSlide], 0, 0, canvas.width, canvas.height, 1);
+      if (slideImages.length > 1) drawCoverImage(ctx, slideImages[nextSlide], 0, 0, canvas.width, canvas.height, fade);
+    }
+
+    function drawMirrored(targetCtx, source, x, y, w, h) {
+      targetCtx.save();
+      targetCtx.translate(w, 0);
+      targetCtx.scale(-1, 1);
+      targetCtx.drawImage(source, x, y, w, h);
+      targetCtx.restore();
+    }
+
+    function onResults(results) {
+      const now = performance.now();
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      drawSlideshowBackground(now);
+
+      maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+      maskCtx.save();
+      maskCtx.filter = `blur(${Number(blur.value)}px)`;
+      drawMirrored(maskCtx, results.segmentationMask, 0, 0, maskCanvas.width, maskCanvas.height);
+      maskCtx.restore();
+
+      personCtx.clearRect(0, 0, personCanvas.width, personCanvas.height);
+      personCtx.save();
+      personCtx.drawImage(maskCanvas, 0, 0);
+      personCtx.globalCompositeOperation = "source-in";
+      drawMirrored(personCtx, results.image, 0, 0, personCanvas.width, personCanvas.height);
+      personCtx.restore();
+
+      ctx.drawImage(personCanvas, 0, 0);
+
+      ctx.save();
+      ctx.globalCompositeOperation = "screen";
+      ctx.globalAlpha = 0.14;
+      ctx.filter = "blur(8px)";
+      ctx.drawImage(personCanvas, 0, 0);
+      ctx.restore();
+
+      processing = false;
+    }
+
+    async function prepareSegmentation() {
+      if (segmentation) return segmentation;
+      segmentation = new SelfieSegmentation({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${file}`
+      });
+      segmentation.setOptions({ modelSelection: 1, selfieMode: false });
+      segmentation.onResults(onResults);
+      return segmentation;
+    }
+
+    async function startCamera() {
+      startButton.disabled = true;
+      setStatus("起動準備中...");
+
+      if (!isSecureEnough()) {
+        setStatus("カメラを使うにはHTTPSが必要です。GitHub Pages等にアップロードして https:// から開いてください。");
+        startButton.disabled = false;
+        return;
+      }
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        setStatus("このブラウザではカメラAPIが使えません。iPhone / iPadはSafariで開いてください。");
+        startButton.disabled = false;
+        return;
+      }
+
+      try {
+        await prepareSegmentation();
+        setStatus("カメラ許可を待っています...");
+        let stream;
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            audio: false,
+            video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } }
+          });
+        } catch (firstErr) {
+          stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: true });
+        }
+
+        video.srcObject = stream;
+        video.setAttribute("playsinline", "");
+        video.setAttribute("webkit-playsinline", "");
+        video.muted = true;
+
+        await new Promise((resolve) => {
+          if (video.readyState >= 2) resolve();
+          else video.onloadeddata = () => resolve();
+        });
+        await video.play();
+
+        cameraRunning = true;
+        startScreen.style.display = "none";
+        panel.style.display = "block";
+        requestAnimationFrame(processLoop);
+      } catch (err) {
+        console.error(err);
+        startButton.disabled = false;
+        if (err.name === "NotAllowedError" || err.name === "PermissionDeniedError") {
+          setStatus("カメラ許可が拒否されました。Safari/Chromeの設定でカメラを許可してください。");
+        } else if (err.name === "NotFoundError" || err.name === "DevicesNotFoundError") {
+          setStatus("カメラが見つかりません。別のブラウザで試してください。");
+        } else if (err.name === "NotReadableError") {
+          setStatus("他のアプリがカメラを使用中の可能性があります。カメラアプリ等を閉じて再度試してください。");
+        } else {
+          setStatus("カメラ開始に失敗しました：" + err.name + " / " + err.message);
+        }
+      }
+    }
+
+    async function processLoop(now) {
+      if (!cameraRunning) return;
+      requestAnimationFrame(processLoop);
+      if (processing) return;
+      if (now - lastFrameTime < 1000 / targetFPS) return;
+      if (video.readyState < 2) return;
+      lastFrameTime = now;
+      processing = true;
+      try {
+        await segmentation.send({ image: video });
+      } catch (err) {
+        console.error(err);
+        processing = false;
+      }
+    }
+
+    startButton.addEventListener("click", startCamera);
+    startButton.addEventListener("touchend", (e) => {
+      e.preventDefault();
+      startCamera();
+    }, { passive: false });
+
+    function idleBackground(now) {
+      if (!cameraRunning) {
+        drawFallbackBackground(now);
+        requestAnimationFrame(idleBackground);
+      }
+    }
+    requestAnimationFrame(idleBackground);
+  </script>
+</body>
+</html>
