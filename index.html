@@ -4,7 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>人物認識 背景スライドショー</title>
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js"></script>
+  <!-- 新版 MediaPipe Tasks Vision -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/vision_bundle.js" crossorigin="anonymous"></script>
   <style>
     html, body {
       margin: 0; width: 100%; height: 100%; overflow: hidden;
@@ -29,7 +30,7 @@
       box-shadow: 0 20px 60px rgba(0,0,0,0.35);
     }
     .startCard h1 { margin: 0 0 12px; font-size: 21px; line-height: 1.35; }
-    .startCard p { margin: 8px 0; font-size: 14px; line-height: 1.7; opacity: 0.9; }
+    .startCard p  { margin: 8px 0; font-size: 14px; line-height: 1.7; opacity: 0.9; }
     #startButton {
       margin-top: 16px; width: 100%; border: 0; border-radius: 999px;
       padding: 15px 18px; font-size: 17px; font-weight: 700;
@@ -43,21 +44,17 @@
     .panel {
       position: fixed;
       left: max(12px, env(safe-area-inset-left));
-      top: max(12px, env(safe-area-inset-top));
+      top:  max(12px, env(safe-area-inset-top));
       z-index: 10; padding: 11px 12px; border-radius: 16px;
       color: white; background: rgba(0,0,0,0.48); backdrop-filter: blur(10px);
       font-size: 12px; line-height: 1.55; user-select: none;
       max-width: min(88vw, 340px);
     }
     .panel label { display: block; margin-top: 8px; }
-    .panel input[type="file"] { width: 100%; max-width: 300px; font-size: 12px; }
+    .panel input[type="file"]  { width: 100%; max-width: 300px; font-size: 12px; }
     .panel input[type="range"] { width: 150px; vertical-align: middle; }
     .btnRow { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
-    .smallButton {
-      border: 0; border-radius: 999px;
-      padding: 7px 12px; background: white; color: #111;
-      cursor: pointer; font-size: 12px;
-    }
+    .smallButton { border: 0; border-radius: 999px; padding: 7px 12px; background: white; color: #111; cursor: pointer; font-size: 12px; }
     .smallButton.danger { background: #ff4444; color: white; }
     #savedCount { font-size: 11px; opacity: 0.8; margin-top: 4px; }
     .hint { margin-top: 6px; opacity: 0.76; font-size: 11px; }
@@ -97,9 +94,7 @@
   </div>
 
   <script>
-    // ─────────────────────────────────────────
-    // DOM refs
-    // ─────────────────────────────────────────
+    // ─── DOM ────────────────────────────────────
     const video       = document.getElementById("video");
     const canvas      = document.getElementById("output");
     const ctx         = canvas.getContext("2d", { alpha: false });
@@ -116,52 +111,32 @@
     const clearSaved  = document.getElementById("clearSaved");
     const savedCount  = document.getElementById("savedCount");
 
-    // ─────────────────────────────────────────
-    // オフスクリーン canvas（起動時に一括確保・再利用）
-    // ─────────────────────────────────────────
+    // ─── オフスクリーンCanvas ───────────────────
     const personCanvas = document.createElement("canvas");
     const personCtx    = personCanvas.getContext("2d");
-
-    // マスク処理用（CSS filter を使わずピクセル直操作）
     const maskCanvas   = document.createElement("canvas");
     const maskCtx      = maskCanvas.getContext("2d");
+    // マスク読み取り用（willReadFrequently で最適化）
+    const readCanvas   = document.createElement("canvas");
+    const readCtx      = readCanvas.getContext("2d", { willReadFrequently: true });
 
-    // EMA（指数移動平均）平滑化マスク — Float32Array で保持
-    let emaBuffer = null; // Float32Array, サイズ = w*h
-
-    // ─────────────────────────────────────────
-    // スライドショー
-    // ─────────────────────────────────────────
-    let slideImages    = [];   // {img, dataUrl} の配列
-    let currentSlide   = 0;
-    let nextSlide      = 0;
+    // ─── スライドショー ─────────────────────────
+    let slideImages    = [];
+    let currentSlide   = 0, nextSlide = 0;
     let lastSwitchTime = performance.now();
     const fadeDuration = 800;
 
-    // ─────────────────────────────────────────
-    // その他状態
-    // ─────────────────────────────────────────
-    let segmentation  = null;
+    // ─── 状態 ───────────────────────────────────
+    let segmenter     = null;
     let cameraRunning = false;
-    let processing    = false;
-    let lastFrameTime = 0;
-    const targetFPS   = 24;
-
-    // EMAの重み（0に近いほど前フレームを重視→ちらつき減・反応遅め）
-    // 0.25 = 新フレーム25%、過去75% → かなり安定
-    const EMA_ALPHA = 0.25;
-
-    // マスクの二値化しきい値（0〜1）。高いほど輪郭が締まる
-    const MASK_THRESHOLD = 0.50;
+    let rafId         = null;
 
     const fallbackBackgrounds = [
       ["#1b2735","#090a0f"], ["#24404f","#7aa6b2"],
       ["#3b2557","#8d5b7a"], ["#164f55","#90ba8f"]
     ];
 
-    // ─────────────────────────────────────────
-    // Canvas リサイズ
-    // ─────────────────────────────────────────
+    // ─── Canvas リサイズ ────────────────────────
     function resizeCanvas() {
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
       const w = Math.floor(window.innerWidth  * dpr);
@@ -171,16 +146,12 @@
       canvas.style.height = window.innerHeight + "px";
       personCanvas.width = w; personCanvas.height = h;
       maskCanvas.width   = w; maskCanvas.height   = h;
-      // EMAバッファはマスクサイズ基準でbuildMask内でリセット
-      emaBuffer = null;
     }
     window.addEventListener("resize", resizeCanvas);
     window.addEventListener("orientationchange", () => setTimeout(resizeCanvas, 250));
     resizeCanvas();
 
-    // ─────────────────────────────────────────
-    // UI イベント
-    // ─────────────────────────────────────────
+    // ─── UI イベント ─────────────────────────────
     function setStatus(msg) { statusEl.textContent = msg; }
 
     speed.addEventListener("input", () =>
@@ -192,7 +163,6 @@
     clearSaved.addEventListener("click", () => {
       if (!confirm("保存した写真をすべて削除しますか？")) return;
       localStorage.removeItem("bgImages");
-      for (const s of slideImages) if (s._objectUrl) URL.revokeObjectURL(s._objectUrl);
       slideImages = []; currentSlide = 0; nextSlide = 0;
       updateSavedCount();
     });
@@ -208,53 +178,45 @@
       }
     });
 
-    // ─────────────────────────────────────────
-    // 写真の保存・読み込み（localStorage / Base64）
-    // ─────────────────────────────────────────
+    // ─── 写真の保存・読み込み ──────────────────
     function updateSavedCount() {
       const n = slideImages.length;
       savedCount.textContent = n > 0 ? `📷 ${n}枚の写真が読み込まれています` : "写真が選択されていません";
     }
 
-    // File → Base64 dataUrl
     function fileToDataUrl(file) {
       return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = e => resolve(e.target.result);
-        reader.onerror = reject;
-        reader.readAsDataURL(file);
+        const r = new FileReader();
+        r.onload = e => resolve(e.target.result);
+        r.onerror = reject;
+        r.readAsDataURL(file);
       });
     }
 
-    // dataUrl → Image
     function dataUrlToImage(dataUrl) {
-      return new Promise((resolve) => {
+      return new Promise(resolve => {
         const img = new Image();
-        img.onload = () => resolve(img);
+        img.onload  = () => resolve(img);
         img.onerror = () => resolve(null);
         img.src = dataUrl;
       });
     }
 
-    // localStorage に保存（容量超過時は古いものを除外）
     function saveToStorage(dataUrls) {
       try {
         localStorage.setItem("bgImages", JSON.stringify(dataUrls));
       } catch(e) {
-        // 容量超過: 末尾から削って再試行
-        console.warn("localStorage 容量超過。古い写真を減らします。");
         const trimmed = dataUrls.slice(-Math.max(1, dataUrls.length - 1));
         try { localStorage.setItem("bgImages", JSON.stringify(trimmed)); } catch(e2) {}
       }
     }
 
-    // ページ起動時に保存済み写真を復元
     async function loadSavedImages() {
       try {
         const raw = localStorage.getItem("bgImages");
         if (!raw) return;
         const dataUrls = JSON.parse(raw);
-        if (!Array.isArray(dataUrls) || dataUrls.length === 0) return;
+        if (!Array.isArray(dataUrls) || !dataUrls.length) return;
         setStatus("保存済み写真を読み込み中...");
         const imgs = [];
         for (const url of dataUrls) {
@@ -262,21 +224,16 @@
           if (img) imgs.push({ img, dataUrl: url });
         }
         slideImages = imgs;
-        currentSlide = 0;
-        nextSlide = imgs.length > 1 ? 1 : 0;
+        currentSlide = 0; nextSlide = imgs.length > 1 ? 1 : 0;
         lastSwitchTime = performance.now();
         updateSavedCount();
         setStatus("保存済み写真を復元しました ✓");
-      } catch(e) {
-        console.warn("写真の復元に失敗:", e);
-      }
+      } catch(e) { console.warn("復元失敗:", e); }
     }
 
-    // ファイル選択時：既存に追加して保存
     fileInput.addEventListener("change", async (e) => {
       const files = Array.from(e.target.files || []);
-      if (files.length === 0) return;
-
+      if (!files.length) return;
       setStatus("写真を読み込み中...");
       const newEntries = [];
       for (const file of files) {
@@ -284,52 +241,39 @@
         const img = await dataUrlToImage(dataUrl);
         if (img) newEntries.push({ img, dataUrl });
       }
-
-      // 既存に追加（重複なし）
       slideImages = [...slideImages, ...newEntries];
-      currentSlide = 0;
-      nextSlide = slideImages.length > 1 ? 1 : 0;
+      currentSlide = 0; nextSlide = slideImages.length > 1 ? 1 : 0;
       lastSwitchTime = performance.now();
       updateSavedCount();
-
-      // dataUrl 配列を localStorage に保存
       saveToStorage(slideImages.map(s => s.dataUrl));
       setStatus("写真を保存しました ✓");
       fileInput.value = "";
     });
 
-    // ─────────────────────────────────────────
-    // 背景描画
-    // ─────────────────────────────────────────
-    function drawCoverImage(targetCtx, img, x, y, w, h, alpha = 1) {
-      if (!img || !img.width || !img.height) return;
-      const imgRatio = img.width / img.height;
-      const canRatio = w / h;
+    // ─── 背景描画 ───────────────────────────────
+    function drawCoverImage(tCtx, img, x, y, w, h, alpha = 1) {
+      if (!img || !img.width) return;
+      const ir = img.width / img.height, cr = w / h;
       let sx, sy, sw, sh;
-      if (imgRatio > canRatio) {
-        sh = img.height; sw = img.height * canRatio;
-        sx = (img.width - sw) / 2; sy = 0;
-      } else {
-        sw = img.width; sh = img.width / canRatio;
-        sx = 0; sy = (img.height - sh) / 2;
-      }
-      targetCtx.save();
-      targetCtx.globalAlpha = alpha;
-      targetCtx.drawImage(img, sx, sy, sw, sh, x, y, w, h);
-      targetCtx.restore();
+      if (ir > cr) { sh = img.height; sw = sh * cr; sx = (img.width - sw) / 2; sy = 0; }
+      else          { sw = img.width;  sh = sw / cr; sx = 0; sy = (img.height - sh) / 2; }
+      tCtx.save();
+      tCtx.globalAlpha = alpha;
+      tCtx.drawImage(img, sx, sy, sw, sh, x, y, w, h);
+      tCtx.restore();
     }
 
-    function drawFallbackBackground(now) {
-      const index = Math.floor(now / Number(speed.value)) % fallbackBackgrounds.length;
-      const [c0, c1] = fallbackBackgrounds[index];
+    function drawFallbackBg(now) {
+      const idx = Math.floor(now / Number(speed.value)) % fallbackBackgrounds.length;
+      const [c0, c1] = fallbackBackgrounds[idx];
       const g = ctx.createLinearGradient(0, 0, canvas.width, canvas.height);
       g.addColorStop(0, c0); g.addColorStop(1, c1);
       ctx.fillStyle = g;
       ctx.fillRect(0, 0, canvas.width, canvas.height);
     }
 
-    function drawSlideshowBackground(now) {
-      if (slideImages.length === 0) { drawFallbackBackground(now); return; }
+    function drawSlideshowBg(now) {
+      if (!slideImages.length) { drawFallbackBg(now); return; }
       const interval = Number(speed.value);
       if (now - lastSwitchTime > interval) {
         currentSlide = nextSlide;
@@ -337,83 +281,60 @@
         lastSwitchTime = now;
       }
       const fade = Math.min(1, (now - lastSwitchTime) / fadeDuration);
-      drawCoverImage(ctx, slideImages[currentSlide].img, 0, 0, canvas.width, canvas.height, 1);
+      drawCoverImage(ctx, slideImages[currentSlide].img, 0, 0, canvas.width, canvas.height);
       if (slideImages.length > 1)
         drawCoverImage(ctx, slideImages[nextSlide].img, 0, 0, canvas.width, canvas.height, fade);
     }
 
-    // ─────────────────────────────────────────
-    // カメラ映像の描画（左右反転 + cover全画面）
-    // ─────────────────────────────────────────
-    function drawMirroredCover(targetCtx, source, cw, ch) {
+    // ─── カメラ映像 cover + 左右反転 ───────────
+    function drawMirroredCover(tCtx, source, cw, ch) {
       const srcW = video.videoWidth  || source.width  || cw;
       const srcH = video.videoHeight || source.height || ch;
-      const vAR = srcW / srcH;
-      const cAR = cw / ch;
-
-      // 常にcoverで全画面（左右・上下が切れても画面を埋める）
+      const vAR = srcW / srcH, cAR = cw / ch;
       let dstW, dstH;
       if (vAR > cAR) { dstH = ch; dstW = ch * vAR; }
       else            { dstW = cw; dstH = cw / vAR; }
-      const dstX = (cw - dstW) / 2;
-      const dstY = (ch - dstH) / 2;
-
-      targetCtx.save();
-      targetCtx.translate(cw, 0);
-      targetCtx.scale(-1, 1);
-      targetCtx.drawImage(source, 0, 0, srcW, srcH, cw - dstX - dstW, dstY, dstW, dstH);
-      targetCtx.restore();
+      const dstX = (cw - dstW) / 2, dstY = (ch - dstH) / 2;
+      tCtx.save();
+      tCtx.translate(cw, 0);
+      tCtx.scale(-1, 1);
+      tCtx.drawImage(source, 0, 0, srcW, srcH, cw - dstX - dstW, dstY, dstW, dstH);
+      tCtx.restore();
     }
 
-    // ─────────────────────────────────────────
-    // マスク処理：EMA + ピクセル直操作（完全同期）
-    // ─────────────────────────────────────────
+    // ─── マスク構築 ─────────────────────────────
+    // 新版 tasks-vision は confidenceMasks[0] が Float32Array (0.0〜1.0)
+    // 人物ピクセル = 1.0、背景 = 0.0
+    function buildMask(confidenceMask, maskWidth, maskHeight, cw, ch) {
+      const blurR = Math.max(0, Number(blur.value));
 
-    // EMA処理は軽量な固定サイズで行う（処理コスト削減・輪郭改善）
-    const EMA_W = 256, EMA_H = 256;
-
-    // EMA用キャンバス（縮小サイズ固定）
-    const readCanvas = document.createElement("canvas");
-    const readCtx    = readCanvas.getContext("2d", { willReadFrequently: true });
-    readCanvas.width = EMA_W; readCanvas.height = EMA_H;
-
-    function buildMask(segMask, cw, ch) {
-      const srcW = video.videoWidth  || segMask.width  || cw;
-      const srcH = video.videoHeight || segMask.height || ch;
-
-      // coverサイズ計算（映像と同じ変換）
-      const vAR = srcW / srcH;
-      const cAR = cw / ch;
+      // coverサイズ（映像と同じ変換）
+      const srcW = video.videoWidth  || cw;
+      const srcH = video.videoHeight || ch;
+      const vAR  = srcW / srcH, cAR = cw / ch;
       let dstW, dstH;
       if (vAR > cAR) { dstH = ch; dstW = ch * vAR; }
       else            { dstW = cw; dstH = cw / vAR; }
-      const dstX = (cw - dstW) / 2;
-      const dstY = (ch - dstH) / 2;
+      const dstX = (cw - dstW) / 2, dstY = (ch - dstH) / 2;
 
-      const blurR = Math.max(0, Number(blur.value));
+      // readCanvas にマスクデータをピクセル書き込み
+      if (readCanvas.width !== maskWidth || readCanvas.height !== maskHeight) {
+        readCanvas.width = maskWidth; readCanvas.height = maskHeight;
+      }
+      const imgData = readCtx.createImageData(maskWidth, maskHeight);
+      const d = imgData.data;
 
-      // ── Step1: マスクを 256x256 に縮小して読み取る ──
-      readCtx.clearRect(0, 0, EMA_W, EMA_H);
-      readCtx.drawImage(segMask, 0, 0, EMA_W, EMA_H);
-      const id = readCtx.getImageData(0, 0, EMA_W, EMA_H);
-      const d  = id.data;
-
-      // ── Step2: ピクセル処理 ──
-      // ・RGB=0（黒固定）でblur時の色滲みを防ぐ
-      // ・アルファ値にガンマ補正（^1.5）をかけて端を急峻に絞る
-      //   これがerode相当：不確かな半透明ピクセルを透明側に引き込む
-      for (let i = 0; i < EMA_W * EMA_H; i++) {
-        const raw = d[i * 4] / 255;          // MediaPipe確率値 0〜1
-        const a   = Math.pow(raw, 1.5);      // 端を絞る（erode相当）
+      for (let i = 0; i < maskWidth * maskHeight; i++) {
+        const raw = confidenceMask[i];           // 0.0〜1.0
+        const a   = Math.pow(raw, 1.4);          // ガンマ補正で輪郭を内側に締める
         d[i * 4]     = 0;
         d[i * 4 + 1] = 0;
         d[i * 4 + 2] = 0;
-        d[i * 4 + 3] = Math.round(a * 255);
+        d[i * 4 + 3] = Math.min(255, Math.round(a * 255));
       }
-      readCtx.putImageData(id, 0, 0);
+      readCtx.putImageData(imgData, 0, 0);
 
-      // ── Step3: maskCanvas にcoverサイズで描画 ──
-      // blurを最小限にかけてフェザリング（contrastは使わない＝白縁なし）
+      // maskCanvas に cover + 左右反転で描画
       maskCtx.clearRect(0, 0, cw, ch);
       maskCtx.save();
       if (blurR > 0) {
@@ -421,25 +342,47 @@
       }
       maskCtx.translate(cw, 0);
       maskCtx.scale(-1, 1);
-      maskCtx.drawImage(readCanvas, 0, 0, EMA_W, EMA_H, cw - dstX - dstW, dstY, dstW, dstH);
+      maskCtx.drawImage(readCanvas, 0, 0, maskWidth, maskHeight,
+        cw - dstX - dstW, dstY, dstW, dstH);
       maskCtx.restore();
     }
 
-    // ─────────────────────────────────────────
-    // セグメンテーション結果のコールバック
-    // ─────────────────────────────────────────
-    function onResults(results) {
+    // ─── メインレンダリングループ ───────────────
+    // 新版 tasks-vision は segmentForVideo() を rAF 内で同期実行
+    function renderLoop() {
+      if (!cameraRunning) return;
+      rafId = requestAnimationFrame(renderLoop);
+
+      if (video.readyState < 2) return;
+
       const now = performance.now();
-      const cw = canvas.width, ch = canvas.height;
+      const cw  = canvas.width, ch = canvas.height;
 
-      // マスク構築（EMA平滑化 + 二値化）
-      buildMask(results.segmentationMask, cw, ch);
+      // ── セグメンテーション実行（同期・コールバックなし）──
+      let result;
+      try {
+        result = segmenter.segmentForVideo(video, now);
+      } catch(e) {
+        console.error("segmentForVideo error:", e);
+        return;
+      }
 
-      // 背景
+      // confidenceMasks[0] が人物マスク（Float32Array）
+      const cm = result.confidenceMasks?.[0];
+      if (!cm) return;
+
+      const maskData   = cm.getAsFloat32Array();
+      const maskWidth  = cm.width;
+      const maskHeight = cm.height;
+
+      // マスク構築
+      buildMask(maskData, maskWidth, maskHeight, cw, ch);
+
+      // 背景描画
       ctx.clearRect(0, 0, cw, ch);
-      drawSlideshowBackground(now);
+      drawSlideshowBg(now);
 
-      // 背景を少し暗くして人物を浮かせる
+      // 背景を暗くして人物を浮かせる
       ctx.save();
       ctx.globalAlpha = 0.45;
       ctx.fillStyle = "#000";
@@ -447,38 +390,44 @@
       ctx.restore();
 
       // 人物を切り抜いて描画
-      // ① 映像をpersonCanvasに描く
       personCtx.globalCompositeOperation = "source-over";
       personCtx.clearRect(0, 0, cw, ch);
-      drawMirroredCover(personCtx, results.image, cw, ch);
-      // ② マスクのアルファで切り抜く（destination-in）
+      drawMirroredCover(personCtx, video, cw, ch);
       personCtx.globalCompositeOperation = "destination-in";
       personCtx.drawImage(maskCanvas, 0, 0);
       personCtx.globalCompositeOperation = "source-over";
 
       ctx.drawImage(personCanvas, 0, 0);
 
-
-
-      processing = false;
+      // メモリ解放
+      cm.close();
     }
 
-    // ─────────────────────────────────────────
-    // MediaPipe 初期化
-    // ─────────────────────────────────────────
-    async function prepareSegmentation() {
-      if (segmentation) return segmentation;
-      segmentation = new SelfieSegmentation({
-        locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${f}`
+    // ─── セグメンター初期化 ─────────────────────
+    async function prepareSegmenter() {
+      if (segmenter) return;
+      setStatus("AIモデルを読み込み中...");
+
+      const { ImageSegmenter, FilesetResolver } = window;
+
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+      );
+
+      segmenter = await ImageSegmenter.createFromOptions(vision, {
+        baseOptions: {
+          // Googleの最新セルフィーセグメンターモデル（旧版より高精度）
+          modelAssetPath:
+            "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite",
+          delegate: "GPU",   // WebGL/WebGPU で高速化
+        },
+        runningMode:       "VIDEO",
+        outputCategoryMask:    false,
+        outputConfidenceMasks: true,   // 確率マスク（0.0〜1.0）を使用
       });
-      segmentation.setOptions({ modelSelection: 1, selfieMode: true });
-      segmentation.onResults(onResults);
-      return segmentation;
     }
 
-    // ─────────────────────────────────────────
-    // カメラ起動
-    // ─────────────────────────────────────────
+    // ─── カメラ起動 ─────────────────────────────
     function isSecureEnough() {
       return location.protocol === "https:" ||
              location.hostname === "localhost" ||
@@ -499,20 +448,16 @@
       }
 
       try {
-        await prepareSegmentation();
+        await prepareSegmenter();
         setStatus("カメラ許可を待っています...");
+
         let stream;
         try {
-          // 縦向きを明示的にリクエスト（横長カメラ問題を回避）
           stream = await navigator.mediaDevices.getUserMedia({
             audio: false,
-            video: {
-              facingMode: "user",
-              width:  { ideal: 480, max: 720 },
-              height: { ideal: 640, max: 960 }
-            }
+            video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } }
           });
-        } catch (_) {
+        } catch(_) {
           stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: true });
         }
 
@@ -530,56 +475,32 @@
         cameraRunning = true;
         startScreen.style.display = "none";
         panel.style.display = "block";
-        requestAnimationFrame(processLoop);
-      } catch (err) {
+        renderLoop();
+
+      } catch(err) {
         startButton.disabled = false;
         if (err.name === "NotAllowedError" || err.name === "PermissionDeniedError")
           setStatus("カメラ許可が拒否されました。Safari/Chromeの設定でカメラを許可してください。");
-        else if (err.name === "NotFoundError" || err.name === "DevicesNotFoundError")
-          setStatus("カメラが見つかりません。別のブラウザで試してください。");
+        else if (err.name === "NotFoundError")
+          setStatus("カメラが見つかりません。");
         else if (err.name === "NotReadableError")
-          setStatus("他のアプリがカメラを使用中の可能性があります。カメラアプリ等を閉じて再度試してください。");
+          setStatus("他のアプリがカメラを使用中です。");
         else
           setStatus("カメラ開始に失敗しました：" + err.name + " / " + err.message);
       }
     }
 
-    // ─────────────────────────────────────────
-    // メインループ
-    // ─────────────────────────────────────────
-    async function processLoop(now) {
-      if (!cameraRunning) return;
-      requestAnimationFrame(processLoop);
-      if (processing) return;
-      if (now - lastFrameTime < 1000 / targetFPS) return;
-      if (video.readyState < 2) return;
-      lastFrameTime = now;
-      processing = true;
-      try {
-        await segmentation.send({ image: video });
-      } catch (err) {
-        console.error(err);
-        processing = false;
-      }
-    }
-
-    // ─────────────────────────────────────────
-    // 起動シーケンス
-    // ─────────────────────────────────────────
+    // ─── 起動 ───────────────────────────────────
     startButton.addEventListener("click", startCamera);
     startButton.addEventListener("touchend", e => {
       e.preventDefault(); startCamera();
     }, { passive: false });
 
-    function idleBackground(now) {
-      if (!cameraRunning) {
-        drawFallbackBackground(now);
-        requestAnimationFrame(idleBackground);
-      }
+    function idleBg(now) {
+      if (!cameraRunning) { drawFallbackBg(now); requestAnimationFrame(idleBg); }
     }
-    requestAnimationFrame(idleBackground);
+    requestAnimationFrame(idleBg);
 
-    // 保存済み写真を復元
     loadSavedImages();
   </script>
 </body>
