@@ -90,7 +90,7 @@
       <span id="blurText">3</span>
     </label>
     <label>画角：
-      <input id="zoom" type="range" min="0" max="100" value="0" step="5" />
+      <input id="zoom" type="range" min="0" max="100" value="50" step="5" />
       <span id="zoomText">引き</span>
     </label>
     <div class="btnRow">
@@ -195,10 +195,10 @@
       blurText.textContent = blur.value);
     zoom.addEventListener("input", () => {
       const v = Number(zoom.value);
-      zoomText.textContent = v === 0 ? "引き（最大）" : v === 100 ? "寄り（全画面）" : `${v}%`;
+      zoomText.textContent = v === 0 ? "全体" : v === 100 ? "全画面" : `${v}%`;
     });
     // 初期ラベル
-    zoomText.textContent = "引き（最大）";
+    zoomText.textContent = "50%";
     hidePanel.addEventListener("click", () => panel.style.display = "none");
 
     clearSaved.addEventListener("click", () => {
@@ -360,27 +360,23 @@
     // zoom=100: cover（画面を埋める・寄り）
     // ─────────────────────────────────────────
     function drawMirroredCover(targetCtx, source, cw, ch) {
-      const srcW = source.width || source.videoWidth || cw;
-      const srcH = source.height || source.videoHeight || ch;
-      const srcR = srcW / srcH, dstR = cw / ch;
+      // カメラの実際のアスペクト比を video 要素から取得（results.image は width/height を持たない場合がある）
+      const srcW = video.videoWidth  || source.width  || cw;
+      const srcH = video.videoHeight || source.height || ch;
+      const vAR = srcW / srcH;
+      const cAR = cw / ch;
 
-      // contain サイズ（映像全体が入る最大サイズ）
+      // contain: 映像全体が画面に収まる（引き・letterbox）
       let containW, containH;
-      if (srcR < dstR) {
-        containH = ch; containW = ch * srcR;
-      } else {
-        containW = cw; containH = cw / srcR;
-      }
+      if (vAR < cAR) { containH = ch; containW = ch * vAR; }
+      else            { containW = cw; containH = cw / vAR; }
 
-      // cover サイズ（画面を埋めるサイズ）
+      // cover: 画面を埋める（寄り・クロップ）
       let coverW, coverH;
-      if (srcR > dstR) {
-        coverH = ch; coverW = ch * srcR;
-      } else {
-        coverW = cw; coverH = cw / srcR;
-      }
+      if (vAR > cAR) { coverH = ch; coverW = ch * vAR; }
+      else            { coverW = cw; coverH = cw / vAR; }
 
-      // zoom 0→100 で contain→cover を線形補間
+      // zoom 0→100 で contain→cover を補間
       const t = Number(zoom.value) / 100;
       const dstW = containW + (coverW - containW) * t;
       const dstH = containH + (coverH - containH) * t;
@@ -390,7 +386,6 @@
       targetCtx.save();
       targetCtx.translate(cw, 0);
       targetCtx.scale(-1, 1);
-      // 反転後のX座標を変換
       targetCtx.drawImage(source, 0, 0, srcW, srcH, cw - dstX - dstW, dstY, dstW, dstH);
       targetCtx.restore();
     }
@@ -399,83 +394,73 @@
     // マスク処理：EMA + ピクセル直操作（完全同期）
     // ─────────────────────────────────────────
 
-    // マスク読み取り用の小さいキャンバス（AIマスクの元サイズで使う）
+    // EMA処理は軽量な固定サイズで行う（処理コスト削減・輪郭改善）
+    const EMA_W = 256, EMA_H = 256;
+
+    // EMA用キャンバス（縮小サイズ固定）
     const readCanvas = document.createElement("canvas");
     const readCtx    = readCanvas.getContext("2d", { willReadFrequently: true });
+    readCanvas.width = EMA_W; readCanvas.height = EMA_H;
 
     function buildMask(segMask, cw, ch) {
-      // 1. AIマスクを元サイズで読み取る（通常 256x256）
-      const mw = segMask.width  || 256;
-      const mh = segMask.height || 256;
-      if (readCanvas.width !== mw || readCanvas.height !== mh) {
-        readCanvas.width = mw; readCanvas.height = mh;
-      }
-      readCtx.clearRect(0, 0, mw, mh);
-      readCtx.drawImage(segMask, 0, 0, mw, mh);
-      const maskData = readCtx.getImageData(0, 0, mw, mh).data;
+      // 1. マスクを EMA_W×EMA_H に縮小して読み取る
+      //    （1280×720→256×256 に縮小することで輪郭のノイズが平滑化される）
+      readCtx.clearRect(0, 0, EMA_W, EMA_H);
+      readCtx.drawImage(segMask, 0, 0, EMA_W, EMA_H);
+      const maskData = readCtx.getImageData(0, 0, EMA_W, EMA_H).data;
 
-      // EMAバッファをマスクサイズに合わせる
-      if (!emaBuffer || emaBuffer.length !== mw * mh) {
-        emaBuffer = new Float32Array(mw * mh);
+      // EMAバッファ
+      if (!emaBuffer || emaBuffer.length !== EMA_W * EMA_H) {
+        emaBuffer = new Float32Array(EMA_W * EMA_H);
       }
 
-      // 2. EMA平滑化 → 二値化
-      const binary = new Uint8ClampedArray(mw * mh * 4);
-      for (let i = 0; i < mw * mh; i++) {
-        const raw = maskData[i * 4] / 255; // MediaPipe: 人物=明るい
+      // 2. EMA平滑化 → 二値化（小さいサイズで実行するので高速・高精度）
+      const binary = new Uint8ClampedArray(EMA_W * EMA_H * 4);
+      for (let i = 0; i < EMA_W * EMA_H; i++) {
+        const raw = maskData[i * 4] / 255;
         emaBuffer[i] = EMA_ALPHA * raw + (1 - EMA_ALPHA) * emaBuffer[i];
         const v = emaBuffer[i] >= MASK_THRESHOLD ? 255 : 0;
-        binary[i * 4]     = 255;
-        binary[i * 4 + 1] = 255;
-        binary[i * 4 + 2] = 255;
-        binary[i * 4 + 3] = v;
+        binary[i * 4]     = 0;   // R=0（黒）にすることでblur時の白縁を防ぐ
+        binary[i * 4 + 1] = 0;   // G=0
+        binary[i * 4 + 2] = 0;   // B=0
+        binary[i * 4 + 3] = v;   // アルファのみで切り抜き制御
       }
-      readCtx.putImageData(new ImageData(binary, mw, mh), 0, 0);
+      readCtx.putImageData(new ImageData(binary, EMA_W, EMA_H), 0, 0);
 
-      // 3. maskCanvas に cover + 左右反転で拡大描画（完全同期）
+      // 3. maskCanvas に zoom + 左右反転で描画
+      //    マスクと映像は同じアスペクト比（カメラと同じ）なので、
+      //    映像と完全に同じ変換を適用する
       const blurR = Math.max(0, Number(blur.value));
       maskCtx.clearRect(0, 0, cw, ch);
       maskCtx.save();
       if (blurR > 0) {
         maskCtx.filter = `blur(${Math.round(blurR * 0.7)}px)`;
       }
-      // 映像と同じ変換（zoom対応）
-      const mSrcR = mw / mh, mDstR = cw / ch;
-      let mContainW, mContainH;
-      if (mSrcR < mDstR) { mContainH = ch; mContainW = ch * mSrcR; }
-      else                { mContainW = cw; mContainH = cw / mSrcR; }
-      let mCoverW, mCoverH;
-      if (mSrcR > mDstR) { mCoverH = ch; mCoverW = ch * mSrcR; }
-      else               { mCoverW = cw; mCoverH = cw / mSrcR; }
-      const mt = Number(zoom.value) / 100;
-      const mDstW = mContainW + (mCoverW - mContainW) * mt;
-      const mDstH = mContainH + (mCoverH - mContainH) * mt;
-      const mDstX = (cw - mDstW) / 2;
-      const mDstY = (ch - mDstH) / 2;
+      // zoom補間（映像と同一計算）
+      const vAR = (video.videoWidth || EMA_W) / (video.videoHeight || EMA_H);
+      const cAR = cw / ch;
+      let containW, containH, coverW, coverH;
+      if (vAR < cAR) { containH = ch; containW = ch * vAR; }
+      else            { containW = cw; containH = cw / vAR; }
+      if (vAR > cAR) { coverH = ch; coverW = ch * vAR; }
+      else            { coverW = cw; coverH = cw / vAR; }
+      const t = Number(zoom.value) / 100;
+      const dstW = containW + (coverW - containW) * t;
+      const dstH = containH + (coverH - containH) * t;
+      const dstX = (cw - dstW) / 2;
+      const dstY = (ch - dstH) / 2;
       maskCtx.translate(cw, 0);
       maskCtx.scale(-1, 1);
-      maskCtx.drawImage(readCanvas, 0, 0, mw, mh, cw - mDstX - mDstW, mDstY, mDstW, mDstH);
+      maskCtx.drawImage(readCanvas, 0, 0, EMA_W, EMA_H, cw - dstX - dstW, dstY, dstW, dstH);
       maskCtx.restore();
     }
 
     // ─────────────────────────────────────────
     // セグメンテーション結果のコールバック
     // ─────────────────────────────────────────
-    // デバッグ情報表示（画角問題の原因特定用）
-    let debugShown = false;
     function onResults(results) {
       const now = performance.now();
       const cw = canvas.width, ch = canvas.height;
-
-      // 初回だけサイズをパネルに表示
-      if (!debugShown) {
-        debugShown = true;
-        const img = results.image;
-        const mask = results.segmentationMask;
-        const vw = video.videoWidth, vh = video.videoHeight;
-        savedCount.textContent =
-          `📐 カメラ: ${vw}×${vh} / 映像: ${img.width||'?'}×${img.height||'?'} / マスク: ${mask.width}×${mask.height} / Canvas: ${cw}×${ch}`;
-      }
 
       // マスク構築（EMA平滑化 + 二値化）
       buildMask(results.segmentationMask, cw, ch);
@@ -492,22 +477,18 @@
       ctx.restore();
 
       // 人物を切り抜いて描画
+      // 手順：①映像を描く → ②マスクをdestination-inで適用
+      // （source-inより白縁が出にくい）
       personCtx.clearRect(0, 0, cw, ch);
       personCtx.save();
-      personCtx.drawImage(maskCanvas, 0, 0);
-      personCtx.globalCompositeOperation = "source-in";
       drawMirroredCover(personCtx, results.image, cw, ch);
+      personCtx.globalCompositeOperation = "destination-in";
+      personCtx.drawImage(maskCanvas, 0, 0);
       personCtx.restore();
 
       ctx.drawImage(personCanvas, 0, 0);
 
-      // 輪郭グロー（薄め）
-      ctx.save();
-      ctx.globalCompositeOperation = "screen";
-      ctx.globalAlpha = 0.08;
-      ctx.filter = "blur(10px)";
-      ctx.drawImage(personCanvas, 0, 0);
-      ctx.restore();
+
 
       processing = false;
     }
@@ -552,9 +533,14 @@
         setStatus("カメラ許可を待っています...");
         let stream;
         try {
+          // 縦向きを明示的にリクエスト（横長カメラ問題を回避）
           stream = await navigator.mediaDevices.getUserMedia({
             audio: false,
-            video: { facingMode: "user", width: { ideal: 720 }, height: { ideal: 1280 } }
+            video: {
+              facingMode: "user",
+              width:  { ideal: 480, max: 720 },
+              height: { ideal: 640, max: 960 }
+            }
           });
         } catch (_) {
           stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: true });
