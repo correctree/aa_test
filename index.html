@@ -89,6 +89,10 @@
       <input id="blur" type="range" min="0" max="10" value="3" step="1" />
       <span id="blurText">3</span>
     </label>
+    <label>画角：
+      <input id="zoom" type="range" min="0" max="100" value="0" step="5" />
+      <span id="zoomText">引き</span>
+    </label>
     <div class="btnRow">
       <button class="smallButton" id="hidePanel">UIを隠す</button>
       <button class="smallButton danger" id="clearSaved">写真をリセット</button>
@@ -115,6 +119,8 @@
     const hidePanel   = document.getElementById("hidePanel");
     const clearSaved  = document.getElementById("clearSaved");
     const savedCount  = document.getElementById("savedCount");
+    const zoom        = document.getElementById("zoom");
+    const zoomText    = document.getElementById("zoomText");
 
     // ─────────────────────────────────────────
     // オフスクリーン canvas（起動時に一括確保・再利用）
@@ -187,6 +193,12 @@
       speedText.textContent = (Number(speed.value) / 1000).toFixed(1) + "秒");
     blur.addEventListener("input", () =>
       blurText.textContent = blur.value);
+    zoom.addEventListener("input", () => {
+      const v = Number(zoom.value);
+      zoomText.textContent = v === 0 ? "引き（最大）" : v === 100 ? "寄り（全画面）" : `${v}%`;
+    });
+    // 初期ラベル
+    zoomText.textContent = "引き（最大）";
     hidePanel.addEventListener("click", () => panel.style.display = "none");
 
     clearSaved.addEventListener("click", () => {
@@ -343,22 +355,43 @@
     }
 
     // ─────────────────────────────────────────
-    // カメラ映像のcover描画（左右反転）
+    // カメラ映像の描画（左右反転 + 画角スライダー対応）
+    // zoom=0: contain（映像全体が入る・引き）
+    // zoom=100: cover（画面を埋める・寄り）
     // ─────────────────────────────────────────
     function drawMirroredCover(targetCtx, source, cw, ch) {
       const srcW = source.width || source.videoWidth || cw;
       const srcH = source.height || source.videoHeight || ch;
       const srcR = srcW / srcH, dstR = cw / ch;
-      let sx, sy, sw, sh;
-      if (srcR > dstR) {
-        sh = srcH; sw = srcH * dstR; sx = (srcW - sw) / 2; sy = 0;
+
+      // contain サイズ（映像全体が入る最大サイズ）
+      let containW, containH;
+      if (srcR < dstR) {
+        containH = ch; containW = ch * srcR;
       } else {
-        sw = srcW; sh = srcW / dstR; sx = 0; sy = (srcH - sh) / 2;
+        containW = cw; containH = cw / srcR;
       }
+
+      // cover サイズ（画面を埋めるサイズ）
+      let coverW, coverH;
+      if (srcR > dstR) {
+        coverH = ch; coverW = ch * srcR;
+      } else {
+        coverW = cw; coverH = cw / srcR;
+      }
+
+      // zoom 0→100 で contain→cover を線形補間
+      const t = Number(zoom.value) / 100;
+      const dstW = containW + (coverW - containW) * t;
+      const dstH = containH + (coverH - containH) * t;
+      const dstX = (cw - dstW) / 2;
+      const dstY = (ch - dstH) / 2;
+
       targetCtx.save();
       targetCtx.translate(cw, 0);
       targetCtx.scale(-1, 1);
-      targetCtx.drawImage(source, sx, sy, sw, sh, 0, 0, cw, ch);
+      // 反転後のX座標を変換
+      targetCtx.drawImage(source, 0, 0, srcW, srcH, cw - dstX - dstW, dstY, dstW, dstH);
       targetCtx.restore();
     }
 
@@ -406,17 +439,22 @@
       if (blurR > 0) {
         maskCtx.filter = `blur(${Math.round(blurR * 0.7)}px)`;
       }
-      // cover計算（映像と同じ変換）
-      const srcR = mw / mh, dstR = cw / ch;
-      let sx, sy, sw, sh;
-      if (srcR > dstR) {
-        sh = mh; sw = mh * dstR; sx = (mw - sw) / 2; sy = 0;
-      } else {
-        sw = mw; sh = mw / dstR; sx = 0; sy = (mh - sh) / 2;
-      }
+      // 映像と同じ変換（zoom対応）
+      const mSrcR = mw / mh, mDstR = cw / ch;
+      let mContainW, mContainH;
+      if (mSrcR < mDstR) { mContainH = ch; mContainW = ch * mSrcR; }
+      else                { mContainW = cw; mContainH = cw / mSrcR; }
+      let mCoverW, mCoverH;
+      if (mSrcR > mDstR) { mCoverH = ch; mCoverW = ch * mSrcR; }
+      else               { mCoverW = cw; mCoverH = cw / mSrcR; }
+      const mt = Number(zoom.value) / 100;
+      const mDstW = mContainW + (mCoverW - mContainW) * mt;
+      const mDstH = mContainH + (mCoverH - mContainH) * mt;
+      const mDstX = (cw - mDstW) / 2;
+      const mDstY = (ch - mDstH) / 2;
       maskCtx.translate(cw, 0);
       maskCtx.scale(-1, 1);
-      maskCtx.drawImage(readCanvas, sx, sy, sw, sh, 0, 0, cw, ch);
+      maskCtx.drawImage(readCanvas, 0, 0, mw, mh, cw - mDstX - mDstW, mDstY, mDstW, mDstH);
       maskCtx.restore();
     }
 
