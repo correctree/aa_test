@@ -381,7 +381,7 @@
       const srcW = video.videoWidth  || segMask.width  || cw;
       const srcH = video.videoHeight || segMask.height || ch;
 
-      // 1. マスクをcoverで maskCanvas に描画（映像と同じ変換）
+      // coverサイズ計算（映像と同じ変換）
       const vAR = srcW / srcH;
       const cAR = cw / ch;
       let dstW, dstH;
@@ -390,29 +390,33 @@
       const dstX = (cw - dstW) / 2;
       const dstY = (ch - dstH) / 2;
 
-      // 2. まず生マスクを小さいreadCanvasに描いてピクセル処理
+      const blurR = Math.max(0, Number(blur.value));
+
+      // ── マスクを readCanvas に縮小描画（256x256固定）──
       readCtx.clearRect(0, 0, EMA_W, EMA_H);
       readCtx.drawImage(segMask, 0, 0, EMA_W, EMA_H);
-      const maskData = readCtx.getImageData(0, 0, EMA_W, EMA_H).data;
 
-      // 3. しきい値で二値化（EMAなし＝タイムラグなし）
-      //    侵食マージン: blurで端が溶けた分だけ内側に縮める
-      const blurR = Math.max(0, Number(blur.value));
-      const threshold = 0.55 + blurR * 0.03; // blurが強いほど閾値を上げて縁を削る
-      const binary = new Uint8ClampedArray(EMA_W * EMA_H * 4);
+      // ── ピクセル処理：MediaPipeのグレースケール出力をアルファに変換 ──
+      // RGBに頼らずアルファだけで管理する（白縁の根本解決）
+      const id = readCtx.getImageData(0, 0, EMA_W, EMA_H);
+      const d  = id.data;
       for (let i = 0; i < EMA_W * EMA_H; i++) {
-        const raw = maskData[i * 4] / 255;
-        const v = raw >= threshold ? 255 : 0;
-        binary[i * 4 + 3] = v; // RGB=0のまま、アルファのみ
+        const v = d[i * 4]; // MediaPipeはRチャンネルに確率値を出力
+        d[i * 4]     = 0;   // R
+        d[i * 4 + 1] = 0;   // G
+        d[i * 4 + 2] = 0;   // B  → RGB黒に固定（白縁防止）
+        d[i * 4 + 3] = v;   // A  → 確率値をそのままアルファに
       }
-      readCtx.putImageData(new ImageData(binary, EMA_W, EMA_H), 0, 0);
+      readCtx.putImageData(id, 0, 0);
 
-      // 4. maskCanvas にblur付きで描画（blurは輪郭をなじませる用途のみ）
+      // ── maskCanvas に描画 ──
+      // blur(微小) + contrast(高め) の組み合わせで
+      // 輪郭を締めながら滑らかにする（白縁が出ない定番手法）
       maskCtx.clearRect(0, 0, cw, ch);
       maskCtx.save();
-      if (blurR > 0) {
-        maskCtx.filter = `blur(${Math.round(blurR * 0.8)}px)`;
-      }
+      // feathering: blurで輪郭を少し溶かし、contrastで締め直す
+      const feather = blurR > 0 ? Math.round(blurR * 0.6) : 1;
+      maskCtx.filter = `blur(${feather}px) contrast(12)`;
       maskCtx.translate(cw, 0);
       maskCtx.scale(-1, 1);
       maskCtx.drawImage(readCanvas, 0, 0, EMA_W, EMA_H, cw - dstX - dstW, dstY, dstW, dstH);
@@ -441,14 +445,14 @@
       ctx.restore();
 
       // 人物を切り抜いて描画
-      // 手順：①映像を描く → ②マスクをdestination-inで適用
-      // （source-inより白縁が出にくい）
+      // ① 映像をpersonCanvasに描く
+      personCtx.globalCompositeOperation = "source-over";
       personCtx.clearRect(0, 0, cw, ch);
-      personCtx.save();
       drawMirroredCover(personCtx, results.image, cw, ch);
+      // ② マスクのアルファで切り抜く（destination-in）
       personCtx.globalCompositeOperation = "destination-in";
       personCtx.drawImage(maskCanvas, 0, 0);
-      personCtx.restore();
+      personCtx.globalCompositeOperation = "source-over";
 
       ctx.drawImage(personCanvas, 0, 0);
 
