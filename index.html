@@ -461,9 +461,21 @@
     // ─────────────────────────────────────────
     // セグメンテーション結果のコールバック
     // ─────────────────────────────────────────
+    // デバッグ情報表示（画角問題の原因特定用）
+    let debugShown = false;
     function onResults(results) {
       const now = performance.now();
       const cw = canvas.width, ch = canvas.height;
+
+      // 初回だけサイズをパネルに表示
+      if (!debugShown) {
+        debugShown = true;
+        const img = results.image;
+        const mask = results.segmentationMask;
+        const vw = video.videoWidth, vh = video.videoHeight;
+        savedCount.textContent =
+          `📐 カメラ: ${vw}×${vh} / 映像: ${img.width||'?'}×${img.height||'?'} / マスク: ${mask.width}×${mask.height} / Canvas: ${cw}×${ch}`;
+      }
 
       // マスク構築（EMA平滑化 + 二値化）
       buildMask(results.segmentationMask, cw, ch);
