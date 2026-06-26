@@ -89,10 +89,6 @@
       <input id="blur" type="range" min="0" max="10" value="3" step="1" />
       <span id="blurText">3</span>
     </label>
-    <label>画角：
-      <input id="zoom" type="range" min="0" max="100" value="50" step="5" />
-      <span id="zoomText">引き</span>
-    </label>
     <div class="btnRow">
       <button class="smallButton" id="hidePanel">UIを隠す</button>
       <button class="smallButton danger" id="clearSaved">写真をリセット</button>
@@ -119,8 +115,6 @@
     const hidePanel   = document.getElementById("hidePanel");
     const clearSaved  = document.getElementById("clearSaved");
     const savedCount  = document.getElementById("savedCount");
-    const zoom        = document.getElementById("zoom");
-    const zoomText    = document.getElementById("zoomText");
 
     // ─────────────────────────────────────────
     // オフスクリーン canvas（起動時に一括確保・再利用）
@@ -193,12 +187,6 @@
       speedText.textContent = (Number(speed.value) / 1000).toFixed(1) + "秒");
     blur.addEventListener("input", () =>
       blurText.textContent = blur.value);
-    zoom.addEventListener("input", () => {
-      const v = Number(zoom.value);
-      zoomText.textContent = v === 0 ? "全体" : v === 100 ? "全画面" : `${v}%`;
-    });
-    // 初期ラベル
-    zoomText.textContent = "50%";
     hidePanel.addEventListener("click", () => panel.style.display = "none");
 
     clearSaved.addEventListener("click", () => {
@@ -355,31 +343,18 @@
     }
 
     // ─────────────────────────────────────────
-    // カメラ映像の描画（左右反転 + 画角スライダー対応）
-    // zoom=0: contain（映像全体が入る・引き）
-    // zoom=100: cover（画面を埋める・寄り）
+    // カメラ映像の描画（左右反転 + cover全画面）
     // ─────────────────────────────────────────
     function drawMirroredCover(targetCtx, source, cw, ch) {
-      // カメラの実際のアスペクト比を video 要素から取得（results.image は width/height を持たない場合がある）
       const srcW = video.videoWidth  || source.width  || cw;
       const srcH = video.videoHeight || source.height || ch;
       const vAR = srcW / srcH;
       const cAR = cw / ch;
 
-      // contain: 映像全体が画面に収まる（引き・letterbox）
-      let containW, containH;
-      if (vAR < cAR) { containH = ch; containW = ch * vAR; }
-      else            { containW = cw; containH = cw / vAR; }
-
-      // cover: 画面を埋める（寄り・クロップ）
-      let coverW, coverH;
-      if (vAR > cAR) { coverH = ch; coverW = ch * vAR; }
-      else            { coverW = cw; coverH = cw / vAR; }
-
-      // zoom 0→100 で contain→cover を補間
-      const t = Number(zoom.value) / 100;
-      const dstW = containW + (coverW - containW) * t;
-      const dstH = containH + (coverH - containH) * t;
+      // 常にcoverで全画面（左右・上下が切れても画面を埋める）
+      let dstW, dstH;
+      if (vAR > cAR) { dstH = ch; dstW = ch * vAR; }
+      else            { dstW = cw; dstH = cw / vAR; }
       const dstX = (cw - dstW) / 2;
       const dstY = (ch - dstH) / 2;
 
@@ -403,52 +378,41 @@
     readCanvas.width = EMA_W; readCanvas.height = EMA_H;
 
     function buildMask(segMask, cw, ch) {
-      // 1. マスクを EMA_W×EMA_H に縮小して読み取る
-      //    （1280×720→256×256 に縮小することで輪郭のノイズが平滑化される）
+      const srcW = video.videoWidth  || segMask.width  || cw;
+      const srcH = video.videoHeight || segMask.height || ch;
+
+      // 1. マスクをcoverで maskCanvas に描画（映像と同じ変換）
+      const vAR = srcW / srcH;
+      const cAR = cw / ch;
+      let dstW, dstH;
+      if (vAR > cAR) { dstH = ch; dstW = ch * vAR; }
+      else            { dstW = cw; dstH = cw / vAR; }
+      const dstX = (cw - dstW) / 2;
+      const dstY = (ch - dstH) / 2;
+
+      // 2. まず生マスクを小さいreadCanvasに描いてピクセル処理
       readCtx.clearRect(0, 0, EMA_W, EMA_H);
       readCtx.drawImage(segMask, 0, 0, EMA_W, EMA_H);
       const maskData = readCtx.getImageData(0, 0, EMA_W, EMA_H).data;
 
-      // EMAバッファ
-      if (!emaBuffer || emaBuffer.length !== EMA_W * EMA_H) {
-        emaBuffer = new Float32Array(EMA_W * EMA_H);
-      }
-
-      // 2. EMA平滑化 → 二値化（小さいサイズで実行するので高速・高精度）
+      // 3. しきい値で二値化（EMAなし＝タイムラグなし）
+      //    侵食マージン: blurで端が溶けた分だけ内側に縮める
+      const blurR = Math.max(0, Number(blur.value));
+      const threshold = 0.55 + blurR * 0.03; // blurが強いほど閾値を上げて縁を削る
       const binary = new Uint8ClampedArray(EMA_W * EMA_H * 4);
       for (let i = 0; i < EMA_W * EMA_H; i++) {
         const raw = maskData[i * 4] / 255;
-        emaBuffer[i] = EMA_ALPHA * raw + (1 - EMA_ALPHA) * emaBuffer[i];
-        const v = emaBuffer[i] >= MASK_THRESHOLD ? 255 : 0;
-        binary[i * 4]     = 0;   // R=0（黒）にすることでblur時の白縁を防ぐ
-        binary[i * 4 + 1] = 0;   // G=0
-        binary[i * 4 + 2] = 0;   // B=0
-        binary[i * 4 + 3] = v;   // アルファのみで切り抜き制御
+        const v = raw >= threshold ? 255 : 0;
+        binary[i * 4 + 3] = v; // RGB=0のまま、アルファのみ
       }
       readCtx.putImageData(new ImageData(binary, EMA_W, EMA_H), 0, 0);
 
-      // 3. maskCanvas に zoom + 左右反転で描画
-      //    マスクと映像は同じアスペクト比（カメラと同じ）なので、
-      //    映像と完全に同じ変換を適用する
-      const blurR = Math.max(0, Number(blur.value));
+      // 4. maskCanvas にblur付きで描画（blurは輪郭をなじませる用途のみ）
       maskCtx.clearRect(0, 0, cw, ch);
       maskCtx.save();
       if (blurR > 0) {
-        maskCtx.filter = `blur(${Math.round(blurR * 0.7)}px)`;
+        maskCtx.filter = `blur(${Math.round(blurR * 0.8)}px)`;
       }
-      // zoom補間（映像と同一計算）
-      const vAR = (video.videoWidth || EMA_W) / (video.videoHeight || EMA_H);
-      const cAR = cw / ch;
-      let containW, containH, coverW, coverH;
-      if (vAR < cAR) { containH = ch; containW = ch * vAR; }
-      else            { containW = cw; containH = cw / vAR; }
-      if (vAR > cAR) { coverH = ch; coverW = ch * vAR; }
-      else            { coverW = cw; coverH = cw / vAR; }
-      const t = Number(zoom.value) / 100;
-      const dstW = containW + (coverW - containW) * t;
-      const dstH = containH + (coverH - containH) * t;
-      const dstX = (cw - dstW) / 2;
-      const dstY = (ch - dstH) / 2;
       maskCtx.translate(cw, 0);
       maskCtx.scale(-1, 1);
       maskCtx.drawImage(readCanvas, 0, 0, EMA_W, EMA_H, cw - dstX - dstW, dstY, dstW, dstH);
