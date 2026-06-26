@@ -171,8 +171,8 @@
       canvas.style.height = window.innerHeight + "px";
       personCanvas.width = w; personCanvas.height = h;
       maskCanvas.width   = w; maskCanvas.height   = h;
-      // EMAバッファをリセット（サイズ変化時）
-      emaBuffer = new Float32Array(w * h);
+      // EMAバッファはマスクサイズ基準でbuildMask内でリセット
+      emaBuffer = null;
     }
     window.addEventListener("resize", resizeCanvas);
     window.addEventListener("orientationchange", () => setTimeout(resizeCanvas, 250));
@@ -363,50 +363,61 @@
     }
 
     // ─────────────────────────────────────────
-    // マスク処理：EMA + ピクセル直操作（CSS filter なし）
+    // マスク処理：EMA + ピクセル直操作（完全同期）
     // ─────────────────────────────────────────
+
+    // マスク読み取り用の小さいキャンバス（AIマスクの元サイズで使う）
+    const readCanvas = document.createElement("canvas");
+    const readCtx    = readCanvas.getContext("2d", { willReadFrequently: true });
+
     function buildMask(segMask, cw, ch) {
-      // 1. AIマスクを maskCanvas に描画（cover比率で）
-      maskCtx.clearRect(0, 0, cw, ch);
-      drawMirroredCover(maskCtx, segMask, cw, ch);
+      // 1. AIマスクを元サイズで読み取る（通常 256x256）
+      const mw = segMask.width  || 256;
+      const mh = segMask.height || 256;
+      if (readCanvas.width !== mw || readCanvas.height !== mh) {
+        readCanvas.width = mw; readCanvas.height = mh;
+      }
+      readCtx.clearRect(0, 0, mw, mh);
+      readCtx.drawImage(segMask, 0, 0, mw, mh);
+      const maskData = readCtx.getImageData(0, 0, mw, mh).data;
 
-      // 2. ピクセルデータ取得
-      const imageData = maskCtx.getImageData(0, 0, cw, ch);
-      const data = imageData.data; // RGBA
+      // EMAバッファをマスクサイズに合わせる
+      if (!emaBuffer || emaBuffer.length !== mw * mh) {
+        emaBuffer = new Float32Array(mw * mh);
+      }
 
-      // 3. EMAで平滑化 & しきい値処理
-      const blurR = Math.max(0, Number(blur.value));
-      for (let i = 0; i < cw * ch; i++) {
-        // MediaPipe は人物部分を明るく（R チャンネルが高い）出力する
-        const raw = data[i * 4] / 255; // 0〜1
-
-        // EMA: ema = alpha * raw + (1-alpha) * ema_prev
+      // 2. EMA平滑化 → 二値化
+      const binary = new Uint8ClampedArray(mw * mh * 4);
+      for (let i = 0; i < mw * mh; i++) {
+        const raw = maskData[i * 4] / 255; // MediaPipe: 人物=明るい
         emaBuffer[i] = EMA_ALPHA * raw + (1 - EMA_ALPHA) * emaBuffer[i];
-
-        // しきい値で二値化 → アルファに書き込む
         const v = emaBuffer[i] >= MASK_THRESHOLD ? 255 : 0;
-        data[i * 4]     = 255;
-        data[i * 4 + 1] = 255;
-        data[i * 4 + 2] = 255;
-        data[i * 4 + 3] = v;
+        binary[i * 4]     = 255;
+        binary[i * 4 + 1] = 255;
+        binary[i * 4 + 2] = 255;
+        binary[i * 4 + 3] = v;
       }
-      maskCtx.putImageData(imageData, 0, 0);
+      readCtx.putImageData(new ImageData(binary, mw, mh), 0, 0);
 
-      // 4. ソフトエッジ: blur がある場合のみ CSS filter で軽くなじませる
-      //    （二値化後なので大きくかけても穴が開きにくい）
+      // 3. maskCanvas に cover + 左右反転で拡大描画（完全同期）
+      const blurR = Math.max(0, Number(blur.value));
+      maskCtx.clearRect(0, 0, cw, ch);
+      maskCtx.save();
       if (blurR > 0) {
-        // 一時キャンバスに描画してからコピー（filter スタック問題を回避）
-        const tmp = maskCtx.getImageData(0, 0, cw, ch);
-        maskCtx.save();
-        maskCtx.clearRect(0, 0, cw, ch);
-        maskCtx.filter = `blur(${Math.round(blurR * 0.6)}px)`;
-        // putImageData は filter を無視するので createImageBitmap を使う
-        createImageBitmap(tmp).then(bm => {
-          maskCtx.drawImage(bm, 0, 0);
-          bm.close();
-        });
-        maskCtx.restore();
+        maskCtx.filter = `blur(${Math.round(blurR * 0.7)}px)`;
       }
+      // cover計算（映像と同じ変換）
+      const srcR = mw / mh, dstR = cw / ch;
+      let sx, sy, sw, sh;
+      if (srcR > dstR) {
+        sh = mh; sw = mh * dstR; sx = (mw - sw) / 2; sy = 0;
+      } else {
+        sw = mw; sh = mw / dstR; sx = 0; sy = (mh - sh) / 2;
+      }
+      maskCtx.translate(cw, 0);
+      maskCtx.scale(-1, 1);
+      maskCtx.drawImage(readCanvas, sx, sy, sw, sh, 0, 0, cw, ch);
+      maskCtx.restore();
     }
 
     // ─────────────────────────────────────────
