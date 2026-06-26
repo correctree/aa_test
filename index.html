@@ -392,31 +392,33 @@
 
       const blurR = Math.max(0, Number(blur.value));
 
-      // ── マスクを readCanvas に縮小描画（256x256固定）──
+      // ── Step1: マスクを 256x256 に縮小して読み取る ──
       readCtx.clearRect(0, 0, EMA_W, EMA_H);
       readCtx.drawImage(segMask, 0, 0, EMA_W, EMA_H);
-
-      // ── ピクセル処理：MediaPipeのグレースケール出力をアルファに変換 ──
-      // RGBに頼らずアルファだけで管理する（白縁の根本解決）
       const id = readCtx.getImageData(0, 0, EMA_W, EMA_H);
       const d  = id.data;
+
+      // ── Step2: ピクセル処理 ──
+      // ・RGB=0（黒固定）でblur時の色滲みを防ぐ
+      // ・アルファ値にガンマ補正（^1.5）をかけて端を急峻に絞る
+      //   これがerode相当：不確かな半透明ピクセルを透明側に引き込む
       for (let i = 0; i < EMA_W * EMA_H; i++) {
-        const v = d[i * 4]; // MediaPipeはRチャンネルに確率値を出力
-        d[i * 4]     = 0;   // R
-        d[i * 4 + 1] = 0;   // G
-        d[i * 4 + 2] = 0;   // B  → RGB黒に固定（白縁防止）
-        d[i * 4 + 3] = v;   // A  → 確率値をそのままアルファに
+        const raw = d[i * 4] / 255;          // MediaPipe確率値 0〜1
+        const a   = Math.pow(raw, 1.5);      // 端を絞る（erode相当）
+        d[i * 4]     = 0;
+        d[i * 4 + 1] = 0;
+        d[i * 4 + 2] = 0;
+        d[i * 4 + 3] = Math.round(a * 255);
       }
       readCtx.putImageData(id, 0, 0);
 
-      // ── maskCanvas に描画 ──
-      // blur(微小) + contrast(高め) の組み合わせで
-      // 輪郭を締めながら滑らかにする（白縁が出ない定番手法）
+      // ── Step3: maskCanvas にcoverサイズで描画 ──
+      // blurを最小限にかけてフェザリング（contrastは使わない＝白縁なし）
       maskCtx.clearRect(0, 0, cw, ch);
       maskCtx.save();
-      // feathering: blurで輪郭を少し溶かし、contrastで締め直す
-      const feather = blurR > 0 ? Math.round(blurR * 0.6) : 1;
-      maskCtx.filter = `blur(${feather}px) contrast(12)`;
+      if (blurR > 0) {
+        maskCtx.filter = `blur(${Math.round(blurR * 0.5)}px)`;
+      }
       maskCtx.translate(cw, 0);
       maskCtx.scale(-1, 1);
       maskCtx.drawImage(readCanvas, 0, 0, EMA_W, EMA_H, cw - dstX - dstW, dstY, dstW, dstH);
